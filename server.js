@@ -38,7 +38,6 @@ const SERVERS_CACHE_TTL_MS = 15 * 60 * 1000; // server list fresh for 15 min
 const STREAM_CACHE_TTL_MS = 8 * 60 * 1000;   // decrypted stream fresh for 8 min
 const REQUEST_TIMEOUT_MS = 20000;
 const PROBE_TIMEOUT_MS = 6000;
-const PAYLOAD_MAX_CHARS = 3000; // valid handshake payloads are < 1000 chars
 
 /* --------------------------- curl wrapper -------------------------- */
 /* NOTE: on POST, POSTFIELDS must always be set ('' is fine) — otherwise
@@ -109,39 +108,6 @@ async function encDecGet(stage, text) {
   return json.result;
 }
 
-/* ------------------------- payload validation ----------------------- */
-/* The enc-dec handshake embeds payloads in the request URI (enc-vidfast is
-   GET-only; POST returns 400). A valid stage-1 POST response is a short
-   base64url blob (~300-500 chars). If vidfast instead serves a Cloudflare
-   challenge / error HTML page (several KB), the encoded URI blows past
-   nginx's request-line limit and the stage request fails with an opaque
-   "414 Request-URI Too Large". Validate BEFORE building the URI so the
-   real cause is surfaced — and retry once, since challenges are transient. */
-function assertUriPayload(body, source) {
-  const text = body.trim();
-  if (/<!doctype|<html[\s>]|<body[\s>]|just a moment|cloudflare/i.test(text.slice(0, 400))) {
-    throw new VidfastError(
-      `${source} returned an HTML page (Cloudflare challenge or error page) instead of the expected payload — vidfast is challenging this IP, try again shortly`,
-      502,
-      true
-    );
-  }
-  if (text.length > PAYLOAD_MAX_CHARS) {
-    throw new VidfastError(
-      `${source} returned an oversized payload (${text.length} chars; valid payloads are < 1000) — sending it in the request URI would exceed the upstream URI limit`,
-      502,
-      true
-    );
-  }
-  if (!/^[A-Za-z0-9+/_=-]+$/.test(text)) {
-    throw new VidfastError(
-      `${source} returned an unexpected payload: ${JSON.stringify(text.slice(0, 80))}`,
-      502,
-      true
-    );
-  }
-}
-
 async function decVidfast(text) {
   const res = await curlRequest(`${ENCDEC_API}/dec-vidfast`, {
     method: 'POST',
@@ -171,42 +137,17 @@ function pageUrl(type, id, season, episode) {
 }
 
 async function fetchServersEntry(type, id, season, episode) {
-  // Cloudflare challenges and upstream hiccups are transient: retry once.
-  let lastErr;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      return await fetchServersEntryOnce(type, id, season, episode);
-    } catch (err) {
-      lastErr = err;
-      if (!(err instanceof VidfastError) || !err.retryable || attempt === 2) throw err;
-      await new Promise((r) => setTimeout(r, 800));
-    }
-  }
-  /* istanbul ignore next */
-  throw lastErr;
-}
-
-async function fetchServersEntryOnce(type, id, season, episode) {
   // 1. vidfast page -> embedded token
   const page = await curlRequest(pageUrl(type, id, season, episode), {
     headers: ['Accept: text/html,application/xhtml+xml'],
   });
   if (page.status !== 200) {
     throw new VidfastError(
-      `vidfast page returned HTTP ${page.status} (possibly blocked by Cloudflare)`,
-      502,
-      true
+      `vidfast page returned HTTP ${page.status} (possibly blocked by Cloudflare)`
     );
   }
   const token = extractPageToken(page.body);
-  if (!token) {
-    throw new VidfastError(
-      'could not extract token from the vidfast page (page may be a challenge/error page)',
-      502,
-      true
-    );
-  }
-  assertUriPayload(token, 'vidfast page token');
+  if (!token) throw new VidfastError('could not extract token from the vidfast page');
 
   // 2. stage 1 -> upload url + csrf
   const s1 = await encDecGet(1, token);
@@ -219,21 +160,9 @@ async function fetchServersEntryOnce(type, id, season, episode) {
     method: 'POST',
     headers: [...VIDFAST_HEADERS, `X-CSRF-Token: ${s1.token}`],
   });
-  if (post1.status >= 400) {
-    throw new VidfastError(
-      `stage 1 POST returned HTTP ${post1.status} (upstream refused the handshake)`,
-      502,
-      true
-    );
-  }
   if (!post1.body) {
-    throw new VidfastError(
-      `stage 1 POST returned an empty body (HTTP ${post1.status})`,
-      502,
-      true
-    );
+    throw new VidfastError(`stage 1 POST returned an empty body (HTTP ${post1.status})`);
   }
-  assertUriPayload(post1.body, 'stage 1 POST response');
 
   // 4. stage 2 -> servers url, stream url base, new csrf
   const s2 = await encDecGet(2, post1.body);
@@ -326,11 +255,10 @@ async function probeStreamUrl(url) {
 /* ------------------------------ helpers ---------------------------- */
 
 class VidfastError extends Error {
-  constructor(message, status = 502, retryable = false) {
+  constructor(message, status = 502) {
     super(message);
     this.name = 'VidfastError';
     this.status = status;
-    this.retryable = retryable;
   }
 }
 
