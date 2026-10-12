@@ -1,0 +1,15 @@
+{
+  "name": "vidfast-stream-api",
+  "version": "1.0.0",
+  "description": "Standalone vidfast.vc stream resolver — returns the fastest server's m3u8 by TMDB/IMDb id",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "node-libcurl": "^5.1.2"
+  }
+}
