@@ -25,6 +25,40 @@ const ENCDEC_API = 'https://enc-dec.app/api';
 const WORKER_URL =
   process.env.WORKER_URL || 'https://icy-art-1d5b-movy.ntb7nmytsd.workers.dev/';
 
+// Worker used ONLY for ?data=en (encrypted mode)
+const WORKER_URL_EN =
+  process.env.WORKER_URL_EN || 'https://solitary-mov-8449-yen.ntb7nmytsd.workers.dev/';
+
+/* ------------------------ URL encryptor (?data=en) ------------------------ */
+// When a request includes ?data=en, the stream url is rewritten as
+// `${WORKER_URL_EN}/${encryptedToken}` instead of plain text.
+// Token format (must match the SECRET in your decrypt worker):
+//   v1.<b64url(iv)>.<b64url(ciphertext+authtag)>
+const crypto = require('node:crypto');
+const TOKEN_SECRET =
+  process.env.TOKEN_SECRET ||
+  'bbef4e4840ab0a33b6c129f0de8b1a6735471c82f43e9babc4adc64c5959a64a';
+
+function b64url(buf) {
+  return Buffer.from(buf)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+function encryptUrlToken(rawUrl) {
+  const key = crypto.createHash('sha256').update(TOKEN_SECRET, 'utf8').digest();
+  const iv = crypto
+    .createHash('sha256')
+    .update('iv:' + rawUrl, 'utf8')
+    .digest()
+    .subarray(0, 12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ct = Buffer.concat([cipher.update(rawUrl, 'utf8'), cipher.final()]);
+  return 'v1.' + b64url(iv) + '.' + b64url(Buffer.concat([ct, cipher.getAuthTag()]));
+}
+
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36';
 
@@ -288,9 +322,12 @@ function findServerIndex(servers, param) {
   return idx;
 }
 
-function applyWorkerPrefix(url, worker) {
+function applyWorkerPrefix(url, worker, encrypt = false) {
   if (!worker) return url;
-  return `${WORKER_URL.replace(/\/+$/, '')}/${url}`;
+  const base = encrypt
+    ? WORKER_URL_EN.replace(/\/+$/, '')
+    : WORKER_URL.replace(/\/+$/, '');
+  return `${base}/${encrypt ? encryptUrlToken(url) : url}`;
 }
 
 function tmdbImage(path) {
@@ -303,7 +340,7 @@ function tmdbImage(path) {
 
 async function resolveStream(opts) {
   const t0 = performance.now();
-  const { type, id, season, episode, serverParam, worker = false } = opts;
+  const { type, id, season, episode, serverParam, worker = false, encrypt = false } = opts;
 
   let { entry, cached } = await getServersEntry(type, id, season, episode);
 
@@ -377,8 +414,9 @@ async function resolveStream(opts) {
         totalMs: r.totalMs,
       },
       originalUrl: r.stream.url,
-      url: applyWorkerPrefix(r.stream.url, worker),
-      worker,
+      url: applyWorkerPrefix(r.stream.url, worker || encrypt, encrypt),
+      worker: worker || encrypt,
+      encrypted: encrypt,
       stream: r.stream,
       cached,
       elapsedMs: Math.round(performance.now() - t0),
@@ -429,8 +467,9 @@ async function resolveStream(opts) {
       totalMs: winner.totalMs,
     },
     originalUrl: winner.stream.url,
-    url: applyWorkerPrefix(winner.stream.url, worker),
-    worker,
+    url: applyWorkerPrefix(winner.stream.url, worker || encrypt, encrypt),
+    worker: worker || encrypt,
+    encrypted: encrypt,
     stream: winner.stream,
     servers: results.map(({ stream, ...rest }) => rest),
     cached,
@@ -473,6 +512,7 @@ const server = http.createServer(async (req, res) => {
   const sp = u.searchParams;
   const serverParam = sp.get('server');
   const worker = TRUTHY.has((sp.get('worker') || '').toLowerCase());
+  const encrypt = (sp.get('data') || '').toLowerCase() === 'en';
 
   try {
     // index / health
@@ -481,10 +521,11 @@ const server = http.createServer(async (req, res) => {
         success: true,
         service: 'vidfast-stream-api',
         endpoints: [
-          'GET /api/movie/{tmdbOrImdbId}[?server=1|name][&worker=1]',
-          'GET /api/tv/{tmdbOrImdbId}/{season}/{episode}[?server=1|name][&worker=1]',
+          'GET /api/movie/{tmdbOrImdbId}[?server=1|name][&worker=1][&data=en]',
+          'GET /api/tv/{tmdbOrImdbId}/{season}/{episode}[?server=1|name][&worker=1][&data=en]',
         ],
         worker: WORKER_URL,
+        workerEn: WORKER_URL_EN,
       });
     }
 
@@ -497,7 +538,7 @@ const server = http.createServer(async (req, res) => {
           error: 'invalid id — expected a TMDB id (e.g. 27205) or an IMDb id (e.g. tt15398776)',
         });
       }
-      return sendJson(res, 200, await resolveStream({ type: 'movie', id, serverParam, worker }));
+      return sendJson(res, 200, await resolveStream({ type: 'movie', id, serverParam, worker, encrypt }));
     }
 
     const tv = u.pathname.match(TV_RE);
@@ -511,7 +552,7 @@ const server = http.createServer(async (req, res) => {
           error: 'invalid params — expected /api/tv/{tmdbOrImdbId}/{season}/{episode}, e.g. /api/tv/1399/1/1',
         });
       }
-      return sendJson(res, 200, await resolveStream({ type: 'tv', id, season, episode, serverParam, worker }));
+      return sendJson(res, 200, await resolveStream({ type: 'tv', id, season, episode, serverParam, worker, encrypt }));
     }
 
     return sendJson(res, 404, { success: false, error: 'not found — see GET / for usage' });
