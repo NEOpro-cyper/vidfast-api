@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * VidFast Stream Resolver API — standalone single-file server. (v1.1 hardened)
+ * VidFast Stream Resolver API — standalone single-file server.
  * No framework. Only dependency: node-libcurl (plain Node fetch gets 403'd
  * by vidfast.vc's Cloudflare TLS fingerprinting; libcurl passes).
  *
@@ -10,16 +10,6 @@
  *   GET /                                                  -> info
  *
  * Run:   npm install && node server.js     (PORT env overrides default 3000)
- *
- * v1.1 changes (stage-2 414 fix):
- *   - POST1 response is validated BEFORE it is sent to enc-dec stage 2.
- *     Garbage (HTML challenge pages, error pages, anything > 8 KB) is never
- *     sent upstream, so enc-dec's nginx can no longer answer "414 Request-URI
- *     Too Large" and leak HTML into the API response.
- *   - A bad/failed session automatically triggers a full rebuild with a fresh
- *     page token (up to SESSION_ATTEMPTS times) instead of failing the request.
- *   - Upstream HTML in error bodies is summarized, never forwarded raw.
- *   - enc-dec base URL is env-overridable (ENCDEC_API_URL) for testing.
  */
 
 'use strict';
@@ -31,9 +21,43 @@ const { Curl } = require('node-libcurl');
 
 const PORT = Number(process.env.PORT) || 3000;
 const VIDFAST_BASE = 'https://vidfast.vc';
-const ENCDEC_API = process.env.ENCDEC_API_URL || 'https://enc-dec.app/api';
+const ENCDEC_API = 'https://enc-dec.app/api';
 const WORKER_URL =
   process.env.WORKER_URL || 'https://icy-art-1d5b-movy.ntb7nmytsd.workers.dev/';
+
+// Worker used ONLY for ?data=en (encrypted mode)
+const WORKER_URL_EN =
+  process.env.WORKER_URL_EN || 'https://solitary-mov-8449-yen.ntb7nmytsd.workers.dev/';
+
+/* ------------------------ URL encryptor (?data=en) ------------------------ */
+// When a request includes ?data=en, the stream url is rewritten as
+// `${WORKER_URL_EN}/${encryptedToken}` instead of plain text.
+// Token format (must match the SECRET in your decrypt worker):
+//   v1.<b64url(iv)>.<b64url(ciphertext+authtag)>
+const crypto = require('node:crypto');
+const TOKEN_SECRET =
+  process.env.TOKEN_SECRET ||
+  'bbef4e4840ab0a33b6c129f0de8b1a6735471c82f43e9babc4adc64c5959a64a';
+
+function b64url(buf) {
+  return Buffer.from(buf)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+function encryptUrlToken(rawUrl) {
+  const key = crypto.createHash('sha256').update(TOKEN_SECRET, 'utf8').digest();
+  const iv = crypto
+    .createHash('sha256')
+    .update('iv:' + rawUrl, 'utf8')
+    .digest()
+    .subarray(0, 12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ct = Buffer.concat([cipher.update(rawUrl, 'utf8'), cipher.final()]);
+  return 'v1.' + b64url(iv) + '.' + b64url(Buffer.concat([ct, cipher.getAuthTag()]));
+}
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36';
@@ -48,17 +72,6 @@ const SERVERS_CACHE_TTL_MS = 15 * 60 * 1000; // server list fresh for 15 min
 const STREAM_CACHE_TTL_MS = 8 * 60 * 1000;   // decrypted stream fresh for 8 min
 const REQUEST_TIMEOUT_MS = 20000;
 const PROBE_TIMEOUT_MS = 6000;
-
-/* FIX(v1.1): full session rebuild attempts when a session looks poisoned. */
-const SESSION_ATTEMPTS = Math.max(1, Number(process.env.SESSION_ATTEMPTS) || 2);
-
-/* FIX(v1.1): ciphertext plausibility bounds.
- * Healthy vidfast payloads observed: POST1 ~320 chars, servers ~2048, stream ~532.
- * enc-dec's nginx 414s somewhere between ~9 and ~10 KB of URI. Anything outside
- * these bounds (or containing HTML/whitespace) is garbage — usually a Cloudflare
- * challenge or vidfast error page — and can never decode, so we never send it. */
-const CT_MIN_LEN = 50;
-const CT_MAX_LEN = 8000;
 
 /* --------------------------- curl wrapper -------------------------- */
 /* NOTE: on POST, POSTFIELDS must always be set ('' is fine) — otherwise
@@ -100,33 +113,6 @@ function safeJson(text) {
   }
 }
 
-/* FIX(v1.1): summarize an upstream body for error messages — never leak raw
-   HTML/JSON walls into the API response. */
-function summarizeBody(body, max = 120) {
-  const text = String(body || '').trim();
-  if (!text) return 'empty body';
-  if (/^</.test(text)) {
-    const title = text.match(/<title>([^<]*)<\/title>/i);
-    return `HTML page${title ? ` ("${title[1].trim()}")` : ''} — upstream likely blocked/challenged us`;
-  }
-  if (text.length <= max) return text;
-  return `${text.slice(0, max)}… (${text.length} chars)`;
-}
-
-/* FIX(v1.1): decide whether a payload is plausible vidfast ciphertext.
- * Healthy payloads are base64url-ish printable text with no whitespace and no
- * HTML/JSON structure. Garbage (challenge pages, nginx/vidfast error pages) fails. */
-function isPlausibleCiphertext(text) {
-  if (typeof text !== 'string') return false;
-  const t = text.trim();
-  if (t.length < CT_MIN_LEN || t.length > CT_MAX_LEN) return false;
-  if (!/^[\x21-\x7e]+$/.test(t)) return false;          // printable ASCII, no spaces/newlines
-  if (/^</.test(t)) return false;                        // starts with an HTML/XML tag
-  if (/<\/?[a-z][\w-]*[\s>]/i.test(t.slice(0, 200))) return false; // contains a tag
-  try { JSON.parse(t); return false; } catch { /* not JSON — good */ }
-  return true;
-}
-
 /* --------------------------- token extraction ---------------------- */
 /* TV pages embed the payload under \"token\":\", movie pages under \"en\":\" */
 
@@ -145,19 +131,13 @@ function extractPageToken(html) {
 
 /* ---------------------------- enc-dec.app -------------------------- */
 
-function isUpstream4xxHtml(res) {
-  return res.status >= 400 && /^\s*</.test(res.body);
-}
-
 async function encDecGet(stage, text) {
   const res = await curlRequest(
     `${ENCDEC_API}/enc-vidfast?text=${encodeURIComponent(text)}&stage=${stage}`
   );
   const json = safeJson(res.body);
   if (!json || json.status !== 200 || !json.result) {
-    const err = new VidfastError(`enc-dec stage ${stage} failed: ${summarizeBody(res.body)}`);
-    err.retryable = res.status >= 500 || res.status === 414 || isUpstream4xxHtml(res) || !json;
-    throw err;
+    throw new VidfastError(`enc-dec stage ${stage} failed: ${res.body.slice(0, 160)}`);
   }
   return json.result;
 }
@@ -170,9 +150,7 @@ async function decVidfast(text) {
   });
   const json = safeJson(res.body);
   if (!json || json.status !== 200) {
-    const err = new VidfastError(`dec-vidfast failed: ${summarizeBody(res.body)}`);
-    err.retryable = true;
-    throw err;
+    throw new VidfastError(`dec-vidfast failed: ${res.body.slice(0, 160)}`);
   }
   return json.result;
 }
@@ -192,34 +170,23 @@ function pageUrl(type, id, season, episode) {
     : `${VIDFAST_BASE}/tv/${id}/${season}/${episode}/`;
 }
 
-/* One end-to-end session build: page -> token -> stage1 -> POST1 -> stage2
-   -> POST servers -> decrypt. Throws VidfastError with .retryable on
-   transient/garbage failures; non-retryable only for "media has no servers". */
-async function buildServersSession(type, id, season, episode) {
+async function fetchServersEntry(type, id, season, episode) {
   // 1. vidfast page -> embedded token
   const page = await curlRequest(pageUrl(type, id, season, episode), {
     headers: ['Accept: text/html,application/xhtml+xml'],
   });
   if (page.status !== 200) {
-    const err = new VidfastError(
+    throw new VidfastError(
       `vidfast page returned HTTP ${page.status} (possibly blocked by Cloudflare)`
     );
-    err.retryable = true;
-    throw err;
   }
   const token = extractPageToken(page.body);
-  if (!token) {
-    const err = new VidfastError('could not extract token from the vidfast page');
-    err.retryable = true;
-    throw err;
-  }
+  if (!token) throw new VidfastError('could not extract token from the vidfast page');
 
   // 2. stage 1 -> upload url + csrf
   const s1 = await encDecGet(1, token);
   if (!s1.stage1 || !s1.token) {
-    const err = new VidfastError('enc-dec stage 1 returned an unexpected payload');
-    err.retryable = true;
-    throw err;
+    throw new VidfastError('enc-dec stage 1 returned an unexpected payload');
   }
 
   // 3. POST stage 1
@@ -227,24 +194,14 @@ async function buildServersSession(type, id, season, episode) {
     method: 'POST',
     headers: [...VIDFAST_HEADERS, `X-CSRF-Token: ${s1.token}`],
   });
-
-  /* FIX(v1.1): validate BEFORE stage 2. If vidfast answered with an HTML
-     challenge/error page (the actual root cause of enc-dec "414 Request-URI
-     Too Large"), do NOT forward it upstream — retry with a fresh session. */
-  if (!post1.body || !isPlausibleCiphertext(post1.body)) {
-    const err = new VidfastError(
-      `stage 1 POST returned garbage (HTTP ${post1.status}, ${summarizeBody(post1.body)}) — refreshing session`
-    );
-    err.retryable = true;
-    throw err;
+  if (!post1.body) {
+    throw new VidfastError(`stage 1 POST returned an empty body (HTTP ${post1.status})`);
   }
 
   // 4. stage 2 -> servers url, stream url base, new csrf
   const s2 = await encDecGet(2, post1.body);
   if (!s2.servers || !s2.stream || !s2.token) {
-    const err = new VidfastError('enc-dec stage 2 returned an unexpected payload');
-    err.retryable = true;
-    throw err;
+    throw new VidfastError('enc-dec stage 2 returned an unexpected payload');
   }
 
   // 5. POST servers -> encrypted list
@@ -252,14 +209,8 @@ async function buildServersSession(type, id, season, episode) {
     method: 'POST',
     headers: [...VIDFAST_HEADERS, `X-CSRF-Token: ${s2.token}`],
   });
-
-  /* FIX(v1.1): same validation before the decrypt call. */
-  if (!postServers.body || !isPlausibleCiphertext(postServers.body)) {
-    const err = new VidfastError(
-      `servers POST returned garbage (HTTP ${postServers.status}, ${summarizeBody(postServers.body)}) — refreshing session`
-    );
-    err.retryable = true;
-    throw err;
+  if (!postServers.body) {
+    throw new VidfastError(`servers POST returned an empty body (HTTP ${postServers.status})`);
   }
 
   // 6. decrypt
@@ -288,27 +239,10 @@ async function getServersEntry(type, id, season, episode, force = false) {
   const pending = inflight.get(key);
   if (pending) return { entry: await pending, cached: false };
 
-  /* FIX(v1.1): build the session with automatic full retries. Each attempt
-     re-fetches the page, so every attempt gets a fresh token — this is what
-     turns the old hard "enc-dec stage 2 failed: 414 …" failure into a
-     transparent refresh-and-retry. */
   const task = (async () => {
-    let lastErr;
-    for (let attempt = 1; attempt <= SESSION_ATTEMPTS; attempt++) {
-      try {
-        const entry = await buildServersSession(type, id, season, episode);
-        serversCache.set(key, entry);
-        return entry;
-      } catch (err) {
-        lastErr = err;
-        const retryable =
-          (err && err.retryable !== false && !(err instanceof VidfastError && err.status === 404));
-        if (!retryable || attempt === SESSION_ATTEMPTS) break;
-        // small backoff before rebuilding the session
-        await new Promise((r) => setTimeout(r, 750 * attempt));
-      }
-    }
-    throw lastErr;
+    const entry = await fetchServersEntry(type, id, season, episode);
+    serversCache.set(key, entry);
+    return entry;
   })().finally(() => inflight.delete(key));
 
   inflight.set(key, task);
@@ -325,13 +259,8 @@ async function fetchStreamForServer(entry, server) {
     method: 'POST',
     headers: [...VIDFAST_HEADERS, `X-CSRF-Token: ${entry.csrfToken}`],
   });
-
-  /* FIX(v1.1): validate the stream payload too, so garbage never reaches
-     dec-vidfast and produces a confusing decrypt error. */
-  if (!res.body || !isPlausibleCiphertext(res.body)) {
-    throw new Error(
-      `stream POST returned garbage (HTTP ${res.status}, ${summarizeBody(res.body)})`
-    );
+  if (!res.body) {
+    throw new Error(`stream POST returned an empty body (HTTP ${res.status})`);
   }
 
   const stream = await decVidfast(res.body);
@@ -393,9 +322,12 @@ function findServerIndex(servers, param) {
   return idx;
 }
 
-function applyWorkerPrefix(url, worker) {
+function applyWorkerPrefix(url, worker, encrypt = false) {
   if (!worker) return url;
-  return `${WORKER_URL.replace(/\/+$/, '')}/${url}`;
+  const base = encrypt
+    ? WORKER_URL_EN.replace(/\/+$/, '')
+    : WORKER_URL.replace(/\/+$/, '');
+  return `${base}/${encrypt ? encryptUrlToken(url) : url}`;
 }
 
 function tmdbImage(path) {
@@ -408,7 +340,7 @@ function tmdbImage(path) {
 
 async function resolveStream(opts) {
   const t0 = performance.now();
-  const { type, id, season, episode, serverParam, worker = false } = opts;
+  const { type, id, season, episode, serverParam, worker = false, encrypt = false } = opts;
 
   let { entry, cached } = await getServersEntry(type, id, season, episode);
 
@@ -482,8 +414,9 @@ async function resolveStream(opts) {
         totalMs: r.totalMs,
       },
       originalUrl: r.stream.url,
-      url: applyWorkerPrefix(r.stream.url, worker),
-      worker,
+      url: applyWorkerPrefix(r.stream.url, worker || encrypt, encrypt),
+      worker: worker || encrypt,
+      encrypted: encrypt,
       stream: r.stream,
       cached,
       elapsedMs: Math.round(performance.now() - t0),
@@ -534,8 +467,9 @@ async function resolveStream(opts) {
       totalMs: winner.totalMs,
     },
     originalUrl: winner.stream.url,
-    url: applyWorkerPrefix(winner.stream.url, worker),
-    worker,
+    url: applyWorkerPrefix(winner.stream.url, worker || encrypt, encrypt),
+    worker: worker || encrypt,
+    encrypted: encrypt,
     stream: winner.stream,
     servers: results.map(({ stream, ...rest }) => rest),
     cached,
@@ -578,6 +512,7 @@ const server = http.createServer(async (req, res) => {
   const sp = u.searchParams;
   const serverParam = sp.get('server');
   const worker = TRUTHY.has((sp.get('worker') || '').toLowerCase());
+  const encrypt = (sp.get('data') || '').toLowerCase() === 'en';
 
   try {
     // index / health
@@ -585,12 +520,12 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         success: true,
         service: 'vidfast-stream-api',
-        version: '1.1',
         endpoints: [
-          'GET /api/movie/{tmdbOrImdbId}[?server=1|name][&worker=1]',
-          'GET /api/tv/{tmdbOrImdbId}/{season}/{episode}[?server=1|name][&worker=1]',
+          'GET /api/movie/{tmdbOrImdbId}[?server=1|name][&worker=1][&data=en]',
+          'GET /api/tv/{tmdbOrImdbId}/{season}/{episode}[?server=1|name][&worker=1][&data=en]',
         ],
         worker: WORKER_URL,
+        workerEn: WORKER_URL_EN,
       });
     }
 
@@ -603,7 +538,7 @@ const server = http.createServer(async (req, res) => {
           error: 'invalid id — expected a TMDB id (e.g. 27205) or an IMDb id (e.g. tt15398776)',
         });
       }
-      return sendJson(res, 200, await resolveStream({ type: 'movie', id, serverParam, worker }));
+      return sendJson(res, 200, await resolveStream({ type: 'movie', id, serverParam, worker, encrypt }));
     }
 
     const tv = u.pathname.match(TV_RE);
@@ -617,7 +552,7 @@ const server = http.createServer(async (req, res) => {
           error: 'invalid params — expected /api/tv/{tmdbOrImdbId}/{season}/{episode}, e.g. /api/tv/1399/1/1',
         });
       }
-      return sendJson(res, 200, await resolveStream({ type: 'tv', id, season, episode, serverParam, worker }));
+      return sendJson(res, 200, await resolveStream({ type: 'tv', id, season, episode, serverParam, worker, encrypt }));
     }
 
     return sendJson(res, 404, { success: false, error: 'not found — see GET / for usage' });
@@ -630,30 +565,9 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-/* Allow requiring this file for tests without binding the port. */
-if (require.main === module) {
-  server.listen(PORT, () => {
-    console.log(`vidfast-stream-api v1.1 listening on http://0.0.0.0:${PORT}`);
-    console.log(`  session attempts per request : ${SESSION_ATTEMPTS}`);
-    console.log(`  enc-dec base                 : ${ENCDEC_API}`);
-  });
-}
+server.listen(PORT, () => {
+  console.log(`vidfast-stream-api listening on http://0.0.0.0:${PORT}`);
+});
 
 process.on('unhandledRejection', (e) => console.error('unhandled rejection:', e));
 process.on('uncaughtException', (e) => console.error('uncaught exception:', e));
-
-module.exports = {
-  server,
-  isPlausibleCiphertext,
-  summarizeBody,
-  buildServersSession,
-  getServersEntry,
-  resolveStream,
-  config: {
-    PORT,
-    ENCDEC_API,
-    SESSION_ATTEMPTS,
-    CT_MIN_LEN,
-    CT_MAX_LEN,
-  },
-};
