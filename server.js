@@ -27,7 +27,7 @@ const WORKER_URL =
 
 // Worker used ONLY for ?data=en (encrypted mode)
 const WORKER_URL_EN =
-  process.env.WORKER_URL_EN || 'https://falling-blockmov-aa48-yen.ryklcd0086.workers.dev/';
+  process.env.WORKER_URL_EN || 'https://noisy-feather-adb6.ryklcd0086.workers.dev/vf';
 
 /* ------------------------ URL encryptor (?data=en) ------------------------ */
 // When a request includes ?data=en, the stream url is rewritten as
